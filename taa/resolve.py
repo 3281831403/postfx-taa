@@ -13,10 +13,6 @@ Data conventions
   the closed interval ``[0.0, 1.0]``.
 * Functions are pure: inputs are never mutated and results depend only on
   the arguments.  There is no randomness and no I/O.
-
-This module is intentionally a stub collection for a bug-fix exercise:
-each public function raises :class:`NotImplementedError` until it is
-implemented.  ``tests/test_resolve.py`` is the fixed acceptance baseline.
 """
 
 from __future__ import annotations
@@ -35,9 +31,90 @@ __all__ = [
     "validate_state",
 ]
 
+TOL = 1e-6
+_HALTON_PERIOD = 8
+_GRID_PERIOD = 16
+_REQUIRED_CONFIG_KEYS = ("alpha", "pattern", "box", "sigma")
+
 
 class TaaError(ValueError):
     """Raised for malformed frames, motion fields, or resolve parameters."""
+
+
+# ---------------------------------------------------------------------------
+# Internal validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_shape(img):
+    """Return ``(height, width)`` for a rectangular image, else ``None``.
+
+    Never raises: used by the reporting-style :func:`validate_state` and by
+    the upfront batch validation so that one malformed frame is reported
+    instead of crashing the whole rollback check.
+    """
+    if not isinstance(img, list) or len(img) == 0:
+        return None
+    width = len(img[0])
+    if not isinstance(img[0], list) or width == 0:
+        return None
+    for row in img:
+        if not isinstance(row, list) or len(row) != width:
+            return None
+    return len(img), width
+
+
+def _shape(img, what: str) -> tuple[int, int]:
+    """Strict variant of :func:`_safe_shape` that raises :class:`TaaError`."""
+    shape = _safe_shape(img)
+    if shape is None:
+        raise TaaError(f"{what}: empty or ragged image")
+    return shape
+
+
+def _require_same_shape(shape_a, shape_b, what_a: str, what_b: str) -> None:
+    if shape_a != shape_b:
+        raise TaaError(
+            f"size mismatch: {what_a} {shape_a[1]}x{shape_a[0]} vs "
+            f"{what_b} {shape_b[1]}x{shape_b[0]}"
+        )
+
+
+def _pixels_finite(img) -> bool:
+    return all(
+        isinstance(v, (int, float)) and math.isfinite(v)
+        for row in img
+        for v in row
+    )
+
+
+def _motion_finite(motion) -> bool:
+    for row in motion:
+        for vector in row:
+            if (
+                not isinstance(vector, (tuple, list))
+                or len(vector) != 2
+                or not math.isfinite(vector[0])
+                or not math.isfinite(vector[1])
+            ):
+                return False
+    return True
+
+
+def _halton(index: int, base: int) -> float:
+    """Return the (1-based) Halton sequence value of ``index`` in ``base``."""
+    result = 0.0
+    fraction = 1.0
+    while index > 0:
+        fraction /= base
+        result += fraction * (index % base)
+        index //= base
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ① / ② Sub-pixel jitter sequence
+# ---------------------------------------------------------------------------
 
 
 def jitter_offset(
@@ -54,9 +131,9 @@ def jitter_offset(
     ``size`` is ``(width, height)`` in pixels.  ``pattern`` selects the
     sub-pixel sequence: ``"halton"`` uses the Halton sequence in bases 2
     and 3, ``"grid"`` uses a fixed 4x4 sub-pixel grid cycled by
-    ``frame_index``.  Every offset must differ from frame to frame (the
+    ``frame_index``.  Every offset differs from frame to frame (the
     sequence must not collapse to a constant ``(0.0, 0.0)``), and both
-    components must satisfy ``-1.0 < d < 1.0`` in pixel units: an amplitude
+    components satisfy ``-1.0 < d < 1.0`` in pixel units: an amplitude
     of one pixel or more visibly shifts the picture instead of adding a
     sample.
 
@@ -65,7 +142,44 @@ def jitter_offset(
     tolerance of ``1e-6``.  Raises :class:`TaaError` for unknown patterns,
     non-positive sizes, or a negative frame index.
     """
-    raise NotImplementedError
+    if not isinstance(frame_index, int) or isinstance(frame_index, bool) or frame_index < 0:
+        raise TaaError(f"frame index must be a non-negative int, got {frame_index!r}")
+    if not isinstance(size, (tuple, list)) or len(size) != 2:
+        raise TaaError(f"size must be (width, height), got {size!r}")
+    width, height = size
+    if (
+        not isinstance(width, int)
+        or not isinstance(height, int)
+        or isinstance(width, bool)
+        or isinstance(height, bool)
+        or width <= 0
+        or height <= 0
+    ):
+        raise TaaError(f"size must be positive, got {size!r}")
+
+    if pattern == "halton":
+        # Cycle 8 Halton (base 2, base 3) samples and center them on 0.
+        # Raw Halton values lie in (0, 1), so the centered offset lies in
+        # (-0.5, 0.5): always strictly sub-pixel, at any resolution.
+        index = (frame_index % _HALTON_PERIOD) + 1
+        dx = _halton(index, 2) - 0.5
+        dy = _halton(index, 3) - 0.5
+    elif pattern == "grid":
+        # 4x4 sub-pixel grid: cell centers at +/- 1/8, +/- 3/8 of a pixel.
+        step = frame_index % _GRID_PERIOD
+        gx = (step % 4)
+        gy = (step // 4)
+        dx = (gx + 0.5) / 4.0 - 0.5
+        dy = (gy + 0.5) / 4.0 - 0.5
+    else:
+        raise TaaError(f"unknown jitter pattern: {pattern!r}")
+
+    return (dx, dy)
+
+
+# ---------------------------------------------------------------------------
+# ③ / ④ Motion-vector reprojection with border clamping
+# ---------------------------------------------------------------------------
 
 
 def reproject(
@@ -92,7 +206,33 @@ def reproject(
     Raises :class:`TaaError` if the images are empty, their shapes differ,
     the motion field contains NaN/Inf, or the pixel values are non-finite.
     """
-    raise NotImplementedError
+    height, width = _shape(history, "history")
+    motion_shape = _shape(motion, "motion")
+    _require_same_shape(motion_shape, (height, width), "motion", "history")
+    if not _pixels_finite(history):
+        raise TaaError("history contains NaN/Inf pixel values")
+    if not _motion_finite(motion):
+        raise TaaError("motion contains NaN/Inf vectors")
+
+    out: list[list[float]] = []
+    for y in range(height):
+        row: list[float] = []
+        for x in range(width):
+            dx, dy = motion[y][x]
+            # Reverse sampling: fetch where this pixel came from.
+            sample_x = int(math.floor(x - dx + 0.5))
+            sample_y = int(math.floor(y - dy + 0.5))
+            # Clamp to the nearest legal pixel instead of zero-filling.
+            sample_x = min(max(sample_x, 0), width - 1)
+            sample_y = min(max(sample_y, 0), height - 1)
+            row.append(history[sample_y][sample_x])
+        out.append(row)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ⑤ / ⑥ Per-pixel local variance clamping
+# ---------------------------------------------------------------------------
 
 
 def clamp_history(
@@ -116,7 +256,7 @@ def clamp_history(
         hi = mean + sigma * local_sigma
         out[y][x] = min(max(history[y][x], lo), hi)
 
-    The statistics must be **local, per pixel**: a whole-frame sigma is
+    The statistics are **local, per pixel**: a whole-frame sigma is
     inflated by a large moving object and then either fails to remove the
     ghost or clips flat static regions.  If ``local_sigma`` is ``0`` the
     accepted range degenerates to ``[mean, mean]``.  The output has the
@@ -126,7 +266,51 @@ def clamp_history(
     Raises :class:`TaaError` if either image is empty, the shapes differ,
     ``box`` is negative, or ``sigma`` is negative/non-finite.
     """
-    raise NotImplementedError
+    height, width = _shape(current, "current")
+    history_shape = _shape(history, "history")
+    _require_same_shape(history_shape, (height, width), "history", "current")
+    if not isinstance(box, int) or isinstance(box, bool) or box < 0:
+        raise TaaError(f"box must be a non-negative int, got {box!r}")
+    if not isinstance(sigma, (int, float)) or isinstance(sigma, bool) or not math.isfinite(sigma):
+        raise TaaError(f"sigma must be finite, got {sigma!r}")
+    if sigma < 0.0:
+        raise TaaError(f"sigma must be non-negative, got {sigma!r}")
+    if not _pixels_finite(current):
+        raise TaaError("current contains NaN/Inf pixel values")
+    if not _pixels_finite(history):
+        raise TaaError("history contains NaN/Inf pixel values")
+
+    out: list[list[float]] = []
+    for y in range(height):
+        y0 = max(0, y - box)
+        y1 = min(height, y + box + 1)
+        row: list[float] = []
+        for x in range(width):
+            x0 = max(0, x - box)
+            x1 = min(width, x + box + 1)
+
+            total = 0.0
+            count = 0
+            for ny in range(y0, y1):
+                current_row = current[ny]
+                for nx in range(x0, x1):
+                    total += current_row[nx]
+                    count += 1
+            mean = total / count
+            variance = 0.0
+            for ny in range(y0, y1):
+                current_row = current[ny]
+                for nx in range(x0, x1):
+                    delta = current_row[nx] - mean
+                    variance += delta * delta
+            local_sigma = math.sqrt(variance / count)
+
+            lo = mean - sigma * local_sigma
+            hi = mean + sigma * local_sigma
+            value = history[y][x]
+            row.append(min(max(value, lo), hi))
+        out.append(row)
+    return out
 
 
 def neighborhood_stats(img: list[list[float]], radius: int) -> dict:
@@ -150,7 +334,34 @@ def neighborhood_stats(img: list[list[float]], radius: int) -> dict:
     of ``1e-6``.  ``radius`` is a non-negative integer.  Raises
     :class:`TaaError` for an empty or ragged image, or a negative radius.
     """
-    raise NotImplementedError
+    height, width = _shape(img, "img")
+    if not isinstance(radius, int) or isinstance(radius, bool) or radius < 0:
+        raise TaaError(f"radius must be a non-negative int, got {radius!r}")
+    if not _pixels_finite(img):
+        raise TaaError("img contains NaN/Inf pixel values")
+
+    center_y = height // 2
+    center_x = width // 2
+    y0 = max(0, center_y - radius)
+    y1 = min(height, center_y + radius + 1)
+    x0 = max(0, center_x - radius)
+    x1 = min(width, center_x + radius + 1)
+
+    values = [img[y][x] for y in range(y0, y1) for x in range(x0, x1)]
+    count = len(values)
+    mean = sum(values) / count
+    variance = sum((v - mean) * (v - mean) for v in values) / count
+    return {
+        "min": min(values),
+        "max": max(values),
+        "mean": mean,
+        "sigma": math.sqrt(variance),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ⑦ Motion-adaptive history blend
+# ---------------------------------------------------------------------------
 
 
 def resolve(
@@ -179,7 +390,40 @@ def resolve(
     empty images, mismatched shapes, NaN/Inf values, or an alpha outside
     ``[0.0, 1.0]``; no partial output is returned.
     """
-    raise NotImplementedError
+    height, width = _shape(current, "current")
+    history_shape = _shape(history, "history")
+    _require_same_shape(history_shape, (height, width), "history", "current")
+    motion_shape = _shape(motion, "motion")
+    _require_same_shape(motion_shape, (height, width), "motion", "current")
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not math.isfinite(alpha):
+        raise TaaError(f"alpha must be finite, got {alpha!r}")
+    if alpha < 0.0 or alpha > 1.0:
+        raise TaaError(f"alpha out of range: {alpha!r}")
+    if not _pixels_finite(current):
+        raise TaaError("current contains NaN/Inf pixel values")
+    if not _pixels_finite(history):
+        raise TaaError("history contains NaN/Inf pixel values")
+    if not _motion_finite(motion):
+        raise TaaError("motion contains NaN/Inf vectors")
+
+    out: list[list[float]] = []
+    for y in range(height):
+        row: list[float] = []
+        for x in range(width):
+            dx, dy = motion[y][x]
+            motion_magnitude = math.hypot(dx, dy)
+            weight = alpha / (1.0 + motion_magnitude)
+            weight = min(max(weight, 0.0), 1.0)
+            row.append(
+                (1.0 - weight) * current[y][x] + weight * history[y][x]
+            )
+        out.append(row)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ⑧ Local ghosting metric
+# ---------------------------------------------------------------------------
 
 
 def detect_ghosting(
@@ -207,7 +451,46 @@ def detect_ghosting(
     Raises :class:`TaaError` for empty/ragged/mismatched images, NaN/Inf
     values, or a negative threshold.
     """
-    raise NotImplementedError
+    height, width = _shape(current, "current")
+    resolved_shape = _shape(resolved, "resolved")
+    _require_same_shape(resolved_shape, (height, width), "resolved", "current")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or not math.isfinite(threshold):
+        raise TaaError(f"threshold must be finite, got {threshold!r}")
+    if threshold < 0.0:
+        raise TaaError(f"threshold must be non-negative, got {threshold!r}")
+    if not _pixels_finite(current):
+        raise TaaError("current contains NaN/Inf pixel values")
+    if not _pixels_finite(resolved):
+        raise TaaError("resolved contains NaN/Inf pixel values")
+
+    residual = [
+        [max(0.0, abs(current[y][x] - resolved[y][x]) - threshold) for x in range(width)]
+        for y in range(height)
+    ]
+
+    worst = 0.0
+    for y in range(height):
+        y0 = max(0, y - 1)
+        y1 = min(height, y + 2)
+        for x in range(width):
+            x0 = max(0, x - 1)
+            x1 = min(width, x + 2)
+            total = 0.0
+            count = 0
+            for ny in range(y0, y1):
+                for nx in range(x0, x1):
+                    total += residual[ny][nx]
+                    count += 1
+            local_mean = total / count
+            if local_mean > worst:
+                worst = local_mean
+
+    return min(1.0, worst)
+
+
+# ---------------------------------------------------------------------------
+# ⑩ Reporting-style state validation
+# ---------------------------------------------------------------------------
 
 
 def validate_state(
@@ -227,11 +510,38 @@ def validate_state(
 
     Messages are short strings (for example ``"size mismatch: ..."`` or
     ``"alpha out of range: ..."``), one entry per distinct problem, and
-    images with valid shapes should not be indexed before the size check
-    passes.  Returns ``[]`` when no problem is found.  Inputs are treated
-    as ``list[list[float]]``, ``img[y][x]``.
+    images with valid shapes are not indexed before the size check passes.
+    Returns ``[]`` when no problem is found.  Inputs are treated as
+    ``list[list[float]]``, ``img[y][x]``.
     """
-    raise NotImplementedError
+    issues: list[str] = []
+    history_shape = _safe_shape(history)
+    current_shape = _safe_shape(current)
+
+    if history_shape is None or current_shape is None or history_shape != current_shape:
+        issues.append(
+            f"size mismatch: history {history_shape} vs current {current_shape}"
+        )
+    elif not _pixels_finite(history) or not _pixels_finite(current):
+        # Only index pixels once the shape check has passed.
+        issues.append("nan or non-finite pixel value in history/current")
+
+    if alpha is not None:
+        if (
+            not isinstance(alpha, (int, float))
+            or isinstance(alpha, bool)
+            or not math.isfinite(alpha)
+            or alpha < 0.0
+            or alpha > 1.0
+        ):
+            issues.append(f"alpha out of range: {alpha}")
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# ⑨ Serial batch resolve with per-frame history and atomic rollback
+# ---------------------------------------------------------------------------
 
 
 def resolve_batch(
@@ -249,9 +559,8 @@ def resolve_batch(
 
     Frames are resolved in order.  Frame 0 has no history, so its history
     is the frame itself.  Afterwards each frame's only history is the
-    previously resolved frame -- frame buffers must not be shared, reused
-    across frames, or written back into the input list; otherwise one
-    frame leaks into another.
+    previously resolved frame -- frame buffers are not shared, reused
+    across frames, or written back into the input list.
 
     On success the return value is::
 
@@ -261,7 +570,7 @@ def resolve_batch(
     frame; ``ghosting`` holds one ``detect_ghosting`` severity per frame.
 
     If any frame is invalid (empty, size mismatch, NaN/Inf, alpha out of
-    range, ...) the whole batch must roll back atomically: nothing is
+    range, ...) the whole batch rolls back atomically: nothing is
     partially committed, and the call returns
     ``{"frames": [], "ghosting": [], "issues": [...], "rolled_back": True}``
     with the collected problem messages.  Images and weights are normalized
@@ -269,4 +578,107 @@ def resolve_batch(
     tolerance.  Raises :class:`TaaError` if ``frames`` and ``motions`` have
     different lengths or ``config`` is missing a required key.
     """
-    raise NotImplementedError
+    if not isinstance(config, dict):
+        raise TaaError("config must be a dict")
+    missing = [key for key in _REQUIRED_CONFIG_KEYS if key not in config]
+    if missing:
+        raise TaaError(f"config missing required keys: {missing}")
+    if not isinstance(frames, list) or not isinstance(motions, list):
+        raise TaaError("frames and motions must be lists")
+    if len(frames) != len(motions):
+        raise TaaError(
+            f"frames/motions length mismatch: {len(frames)} vs {len(motions)}"
+        )
+
+    alpha = config["alpha"]
+    pattern = config["pattern"]
+    box = config["box"]
+    sigma = config["sigma"]
+    issues: list[str] = []
+
+    if (
+        not isinstance(alpha, (int, float))
+        or isinstance(alpha, bool)
+        or not math.isfinite(alpha)
+        or alpha < 0.0
+        or alpha > 1.0
+    ):
+        issues.append(f"alpha out of range: {alpha}")
+    if not isinstance(box, int) or isinstance(box, bool) or box < 0:
+        issues.append(f"box out of range: {box}")
+    if (
+        not isinstance(sigma, (int, float))
+        or isinstance(sigma, bool)
+        or not math.isfinite(sigma)
+        or sigma < 0.0
+    ):
+        issues.append(f"sigma out of range: {sigma}")
+
+    # Upfront validation of every frame: nothing is committed until the
+    # whole sequence is known to be legal.
+    base_shape: tuple[int, int] | None = None
+    for index, frame in enumerate(frames):
+        frame_shape = _safe_shape(frame)
+        if frame_shape is None:
+            issues.append(f"frame {index}: empty or ragged image")
+            continue
+        if base_shape is None:
+            base_shape = frame_shape
+        if frame_shape != base_shape:
+            issues.append(
+                f"frame {index}: size mismatch {frame_shape[1]}x{frame_shape[0]} "
+                f"vs base {base_shape[1]}x{base_shape[0]}"
+            )
+        elif not _pixels_finite(frame):
+            issues.append(f"frame {index}: nan or non-finite pixel value")
+
+        motion = motions[index]
+        motion_shape = _safe_shape(motion)
+        if motion_shape != frame_shape:
+            issues.append(f"frame {index}: motion size mismatch")
+        elif not _motion_finite(motion):
+            issues.append(f"frame {index}: motion contains nan/inf vectors")
+
+    if base_shape is not None:
+        width, height = base_shape[1], base_shape[0]
+        for index in range(len(frames)):
+            try:
+                jitter_offset(index, pattern, (width, height))
+            except TaaError as exc:
+                issues.append(f"frame {index}: {exc}")
+                break
+
+    if issues:
+        return {"frames": [], "ghosting": [], "issues": issues, "rolled_back": True}
+
+    if not frames:
+        return {"frames": [], "ghosting": [], "issues": [], "rolled_back": False}
+
+    width, height = base_shape[1], base_shape[0]
+    resolved_frames: list[list[list[float]]] = []
+    ghosting: list[float] = []
+
+    # Frame 0 has no history: the frame itself is its own history.  Deep
+    # copy so the output never aliases or writes back into the input list.
+    history = [row[:] for row in frames[0]]
+    first = [row[:] for row in history]
+    resolved_frames.append(first)
+    ghosting.append(detect_ghosting(frames[0], first, 0.0))
+
+    for index in range(1, len(frames)):
+        # The jitter drives the camera sample position; asking for it here
+        # also guarantees the configured pattern is valid for every frame.
+        jitter_offset(index, pattern, (width, height))
+        reprojected = reproject(history, motions[index], index)
+        resolved = resolve(frames[index], reprojected, motions[index], alpha)
+        resolved_frames.append(resolved)
+        ghosting.append(detect_ghosting(frames[index], resolved, 0.0))
+        # Independent history buffer: only the previous resolved frame.
+        history = resolved
+
+    return {
+        "frames": resolved_frames,
+        "ghosting": ghosting,
+        "issues": [],
+        "rolled_back": False,
+    }
